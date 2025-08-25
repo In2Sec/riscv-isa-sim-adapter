@@ -1,0 +1,51 @@
+# Makefile for spike_wrapper
+
+spike_wrapper_subproject_deps = \
+	riscv \
+	fesvr \
+	softfloat \
+
+spike_wrapper_install_prog_srcs = \
+
+spike_wrapper_srcs = \
+	spike_wrapper.cc \
+
+spike_wrapper_install_lib_srcs = \
+	spike_wrapper.cc \
+
+spike_wrapper_hdrs = \
+	spike_wrapper.h \
+
+spike_wrapper_install_hdrs = \
+	spike_wrapper.h \
+
+spike_wrapper_CFLAGS = -fPIC
+
+# Python wrapper specific targets
+python_wrapper_srcs = \
+	python_binding.cc \
+
+# Build Python module target
+python-wrapper: $(spike_wrapper_objs)
+	@echo "Building Python wrapper..."
+	@if command -v python3 >/dev/null 2>&1 && python3 -c "import pybind11" >/dev/null 2>&1; then \
+		PYTHON_VERSION=$$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"); \
+		if command -v python$${PYTHON_VERSION}-config >/dev/null 2>&1; then \
+			PYTHON_CONFIG="python$${PYTHON_VERSION}-config"; \
+		else \
+			PYTHON_CONFIG="python3-config"; \
+		fi; \
+		PYBIND11_INCLUDE=$$(python3 -c "import pybind11; print(pybind11.get_include())"); \
+		PYTHON_INCLUDES=$$($${PYTHON_CONFIG} --includes); \
+		PYTHON_LDFLAGS=$$($${PYTHON_CONFIG} --ldflags); \
+		PYTHON_EXT_SUFFIX=$$($${PYTHON_CONFIG} --extension-suffix); \
+		CXX_FLAGS="-std=c++17 -fPIC -O2 -g -Wall -Wextra"; \
+		INCLUDES="-I$(src_dir) -I$(src_dir)/build -I$(src_dir)/riscv -I$(src_dir)/fesvr -I$(src_dir)/softfloat -I$(src_dir)/disasm -I$(src_dir)/fdt -I$${PYBIND11_INCLUDE}"; \
+		$(CXX) $${CXX_FLAGS} $${INCLUDES} $${PYTHON_INCLUDES} -c $(src_dir)/spike_wrapper/python_binding.cc -o python_binding.o; \
+		$(CXX) -shared $${PYTHON_LDFLAGS} -o spike_wrapper$${PYTHON_EXT_SUFFIX} python_binding.o $(spike_wrapper_objs); \
+		echo "Python module built: spike_wrapper$${PYTHON_EXT_SUFFIX}"; \
+	else \
+		echo "Warning: Python3 or pybind11 not found, skipping Python wrapper build"; \
+	fi
+
+.PHONY: python-wrapper
