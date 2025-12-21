@@ -82,6 +82,33 @@ struct Checkpoint {
     // Next available memory address for instruction placement
     uint64_t next_instruction_addr;
 
+    // Memory region backup for checkpoint/restore
+    // This is essential for correct rollback when instructions modify memory
+    // (e.g., AMO instructions, store instructions)
+    std::vector<uint8_t> mem_region_backup;
+
+    // ========== Privilege and Mode State ==========
+    // Privilege level (0=U, 1=S, 3=M)
+    // Essential for correct trap handling after restore
+    uint64_t prv;
+
+    // Virtualization mode (for H extension)
+    bool v;
+
+    // Debug mode flag
+    bool debug_mode;
+
+    // ========== All CSRs ==========
+    // Complete CSR state captured as address->value map
+    // This ensures ALL CSRs are properly restored, including:
+    // - Trap handling CSRs (mtvec, mepc, mcause, mtval, etc.)
+    // - Status registers (mstatus, sstatus, etc.)
+    // - Interrupt/exception delegation registers
+    // - PMP configuration
+    // - Floating-point CSRs (fflags, frm, fcsr)
+    // - Custom CSRs
+    std::map<uint64_t, uint64_t> csr_values;
+
     Checkpoint();
 };
 
@@ -164,6 +191,52 @@ public:
     void restore_checkpoint();
 
     /**
+     * Execute a sequence of instructions (for jump sequences)
+     *
+     * Writes all instructions to memory first, then executes them sequentially.
+     * Used for forward jumps where we need to execute jump + middle instructions.
+     *
+     * @param machine_codes List of machine codes to execute
+     * @param sizes List of instruction sizes (2 or 4 bytes each)
+     * @return Number of instructions successfully executed
+     *
+     * @throws std::runtime_error if execution fails
+     */
+    size_t execute_instruction_sequence(
+        const std::vector<uint32_t>& machine_codes,
+        const std::vector<size_t>& sizes);
+
+    /**
+     * Execute a loop sequence until branch condition fails
+     *
+     * Structure: init + (loop_body + decr + branch)*
+     * Executes init once, then loops body+decr+branch until branch doesn't jump back.
+     *
+     * @param init_code Initialization instruction (e.g., li s11, 5)
+     * @param init_size Size of init instruction
+     * @param loop_body_codes Instructions in loop body
+     * @param loop_body_sizes Sizes of loop body instructions
+     * @param decr_code Decrement instruction (e.g., addi s11, s11, -1)
+     * @param decr_size Size of decrement instruction
+     * @param branch_code Branch instruction (e.g., bne s11, zero, offset)
+     * @param branch_size Size of branch instruction
+     * @param max_iterations Maximum iterations (safety limit)
+     * @return Actual number of iterations executed
+     *
+     * @throws std::runtime_error if execution fails
+     */
+    size_t execute_loop_sequence(
+        uint32_t init_code,
+        size_t init_size,
+        const std::vector<uint32_t>& loop_body_codes,
+        const std::vector<size_t>& loop_body_sizes,
+        uint32_t decr_code,
+        size_t decr_size,
+        uint32_t branch_code,
+        size_t branch_size,
+        size_t max_iterations = 100);
+
+    /**
      * Execute one instruction and return register values for XOR and bug filtering
      *
      * Automatically detects instruction size (2 or 4 bytes), writes it to the
@@ -229,6 +302,51 @@ public:
     uint64_t get_pc() const;
 
     /**
+     * Get all general-purpose register values
+     * @return Vector of 32 register values (x0-x31)
+     */
+    std::vector<uint64_t> get_all_xpr() const;
+
+    /**
+     * Get all floating-point register values
+     * @return Vector of 32 register values (f0-f31)
+     */
+    std::vector<uint64_t> get_all_fpr() const;
+
+    /**
+     * Get a CSR value by address
+     * @param csr_addr CSR address (e.g., 0x300 for mstatus)
+     * @return CSR value, or 0 if not found/accessible
+     */
+    uint64_t get_csr(uint64_t csr_addr) const;
+
+    /**
+     * Get all accessible CSR values
+     * @return Map of CSR address -> value
+     */
+    std::map<uint64_t, uint64_t> get_all_csrs() const;
+
+    /**
+     * Get mem_region start address
+     * @return Start address of mem_region (for testing memory operations)
+     */
+    uint64_t get_mem_region_start() const { return mem_region_start_; }
+
+    /**
+     * Get mem_region size
+     * @return Size of mem_region in bytes
+     */
+    size_t get_mem_region_size() const { return mem_region_size_; }
+
+    /**
+     * Read memory at specified address
+     * @param addr Memory address to read from
+     * @param size Number of bytes to read
+     * @return Vector of bytes read from memory
+     */
+    std::vector<uint8_t> read_mem(uint64_t addr, size_t size) const;
+
+    /**
      * Get current instruction index
      * @return Index of next instruction to replace
      */
@@ -285,6 +403,10 @@ private:
     uint64_t instruction_region_end_;
     uint64_t next_instruction_addr_;  // Next available address for instruction
 
+    // Memory region for checkpoint/restore (e.g., .mem_region section)
+    uint64_t mem_region_start_;
+    size_t mem_region_size_;
+
     // Execution state
     size_t current_instr_index_;
 
@@ -327,10 +449,32 @@ private:
     uint32_t read_memory(uint64_t addr);
 
     /**
+     * Check if PC is within the instruction region
+     * @param pc Program counter value to check
+     * @return true if PC is within [instruction_region_start_, instruction_region_end_)
+     */
+    bool is_in_instruction_region(uint64_t pc) const;
+
+    /**
      * Single step execution
      * Executes one instruction on processor
      */
     bool step_processor();
+
+    /**
+     * Step execution with trap handling
+     *
+     * Executes one instruction and continues stepping if the PC ends up
+     * outside the instruction region (e.g., in a trap handler). This ensures
+     * that trap handlers are fully executed before returning control.
+     *
+     * @return true if execution completed successfully with PC back in instruction region
+     * @return false if:
+     *   - Initial step failed
+     *   - Trap handler execution exceeded MAX_STEPS limit
+     *   - Exception occurred during trap handler execution
+     */
+    bool step_until_in_region();
 
     /**
      * Compute XOR value from register values

@@ -14,6 +14,12 @@ PYBIND11_MODULE(spike_engine, m) {
     // Constants
     m.attr("IMMEDIATE_NOT_PRESENT") = IMMEDIATE_NOT_PRESENT;
 
+    // Floating-point register index offset
+    // Register index convention:
+    // - 0-31: Integer registers (x0-x31)
+    // - 32-63: Floating-point registers (f0-f31, use FPR_OFFSET + reg_num)
+    m.attr("FPR_OFFSET") = 32;
+
     // ExecutionResult class
     py::class_<ExecutionResult>(m, "ExecutionResult")
         .def(py::init<>())
@@ -94,6 +100,54 @@ PYBIND11_MODULE(spike_engine, m) {
                  - dest_values_after: Destination register values after execution (for bug filtering)
              )pbdoc")
 
+        .def("execute_instruction_sequence", &SpikeEngine::execute_instruction_sequence,
+             py::arg("machine_codes"),
+             py::arg("sizes"),
+             R"pbdoc(
+             Execute a sequence of instructions (for jump sequences)
+
+             Writes all instructions to memory first, then executes them sequentially.
+             Used for forward jumps where we need to execute jump + middle instructions.
+
+             Args:
+                 machine_codes: List of machine codes to execute
+                 sizes: List of instruction sizes (2 or 4 bytes each)
+
+             Returns:
+                 Number of instructions successfully executed
+             )pbdoc")
+
+        .def("execute_loop_sequence", &SpikeEngine::execute_loop_sequence,
+             py::arg("init_code"),
+             py::arg("init_size"),
+             py::arg("loop_body_codes"),
+             py::arg("loop_body_sizes"),
+             py::arg("decr_code"),
+             py::arg("decr_size"),
+             py::arg("branch_code"),
+             py::arg("branch_size"),
+             py::arg("max_iterations") = 100,
+             R"pbdoc(
+             Execute a loop sequence until branch condition fails
+
+             Structure: init + (loop_body + decr + branch)*
+             Executes init once, then loops body+decr+branch until branch doesn't jump back.
+
+             Args:
+                 init_code: Initialization instruction machine code
+                 init_size: Size of init instruction (2 or 4)
+                 loop_body_codes: List of loop body instruction codes
+                 loop_body_sizes: List of loop body instruction sizes
+                 decr_code: Decrement instruction code
+                 decr_size: Size of decrement instruction
+                 branch_code: Branch instruction code
+                 branch_size: Size of branch instruction
+                 max_iterations: Maximum iterations (default: 100)
+
+             Returns:
+                 Actual number of iterations executed
+             )pbdoc")
+
         .def("get_xpr", &SpikeEngine::get_xpr,
              py::arg("reg_index"),
              "Get general-purpose register value (x0-x31)")
@@ -104,6 +158,30 @@ PYBIND11_MODULE(spike_engine, m) {
 
         .def("get_pc", &SpikeEngine::get_pc,
              "Get program counter value")
+
+        .def("get_all_xpr", &SpikeEngine::get_all_xpr,
+             "Get all general-purpose register values (x0-x31)")
+
+        .def("get_all_fpr", &SpikeEngine::get_all_fpr,
+             "Get all floating-point register values (f0-f31)")
+
+        .def("get_csr", &SpikeEngine::get_csr,
+             py::arg("csr_addr"),
+             "Get CSR value by address (e.g., 0x300 for mstatus)")
+
+        .def("get_all_csrs", &SpikeEngine::get_all_csrs,
+             "Get all accessible CSR values as dict {addr: value}")
+
+        .def("get_mem_region_start", &SpikeEngine::get_mem_region_start,
+             "Get mem_region start address (for testing memory operations)")
+
+        .def("get_mem_region_size", &SpikeEngine::get_mem_region_size,
+             "Get mem_region size in bytes")
+
+        .def("read_mem", &SpikeEngine::read_mem,
+             py::arg("addr"),
+             py::arg("size"),
+             "Read memory at specified address, returns list of bytes")
 
         .def("get_current_index", &SpikeEngine::get_current_index,
              "Get current instruction index")
