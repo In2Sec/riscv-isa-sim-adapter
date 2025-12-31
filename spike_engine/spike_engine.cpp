@@ -7,6 +7,7 @@
 #include "../riscv/decode_macros.h"  // For wait_for_interrupt_t
 #include "../riscv/trap.h"
 #include "../riscv/encoding.h"
+#include "../riscv/triggers.h"      // For triggers::matched_t
 
 #include <stdexcept>
 #include <iostream>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <numeric>
+#include <cxxabi.h> // For abi::__cxa_current_exception_type
 
 namespace spike_engine {
 
@@ -406,7 +408,7 @@ size_t SpikeEngine::execute_sequence(
     uint64_t write_addr = next_instruction_addr_;
     for (size_t i = 0; i < machine_codes.size(); ++i) {
         if (!write_memory(write_addr, machine_codes[i], sizes[i])) {
-            throw std::runtime_error("Failed to write instruction to memory");
+            throw std::runtime_error("Failed to write instruction to memory: " + last_error_);
         }
         write_addr += sizes[i];
     }
@@ -547,7 +549,11 @@ std::vector<uint8_t> SpikeEngine::read_mem(uint64_t addr, size_t size) const {
 
 bool SpikeEngine::write_memory(uint64_t addr, uint32_t code, size_t size) {
     try {
-        mmu_t* mmu = proc_->get_mmu();
+        // Use debug_mmu to bypass PMP/PMA checks so we can always inject instructions
+        // regardless of the current processor state (e.g. if previous instructions
+        // messed up PMP settings).
+        // mmu_t* mmu = proc_->get_mmu();
+        mmu_t* mmu = sim_->debug_mmu;
 
         if (size == 2) {
             // Compressed instruction: write only 16 bits
@@ -562,13 +568,38 @@ bool SpikeEngine::write_memory(uint64_t addr, uint32_t code, size_t size) {
         }
 
         // CRITICAL: Flush TLB and instruction cache after writing to instruction memory.
-        // flush_tlb() clears all TLB entries (insn/load/store) and also calls flush_icache().
-        // This ensures consistent state for both instruction fetch and data access (e.g., AMO).
-        mmu->flush_tlb();
+        // Even though we wrote via debug_mmu, the processor's MMU/ICache might still
+        // hold stale entries.
+        proc_->get_mmu()->flush_tlb();
 
         return true;
     } catch (const std::exception& e) {
         last_error_ = std::string("Memory write failed: ") + e.what();
+        return false;
+    } catch (trap_t& t) {
+        std::ostringstream oss;
+        oss << "Memory write failed: Trap exception: " << t.name() << " (cause=" << t.cause() << ")";
+        last_error_ = oss.str();
+        return false;
+    } catch (triggers::matched_t& t) {
+        std::ostringstream oss;
+        oss << "Memory write failed: Trigger matched: address=0x" << std::hex << t.address << std::dec;
+        last_error_ = oss.str();
+        return false;
+    } catch (...) {
+        std::ostringstream oss;
+        oss << "Memory write failed: Unknown exception";
+        // Advanced: try to get the real type name
+        std::type_info* t = abi::__cxa_current_exception_type();
+        if (t) {
+            int status;
+            char* demangled = abi::__cxa_demangle(t->name(), 0, 0, &status);
+            oss << " (Type: " << (demangled ? demangled : t->name()) << ")";
+            if (demangled) free(demangled);
+        } else {
+            oss << " (truly unknown type)";
+        }
+        last_error_ = oss.str();
         return false;
     }
 }
@@ -604,6 +635,16 @@ bool SpikeEngine::step_processor() {
             oss << ", tval=0x" << std::hex << t.get_tval() << std::dec;
         }
 
+        last_error_ = oss.str();
+        return false;
+    } catch (wait_for_interrupt_t&) {
+        // WFI instruction
+        last_error_ = "Processor hit WFI (wait_for_interrupt_t)";
+        return false;
+    } catch (triggers::matched_t& t) {
+        // Hardware trigger matched
+        std::ostringstream oss;
+        oss << "Processor hit Trigger (triggers::matched_t): address=0x" << std::hex << t.address << std::dec;
         last_error_ = oss.str();
         return false;
     } catch (trap_debug_mode&) {
@@ -659,6 +700,11 @@ bool SpikeEngine::step_until_in_region() {
         // The PC has already been updated by set_pc_and_serialize() in the wfi() macro.
         // We simply return success and continue execution.
         return true;
+    } catch (triggers::matched_t& t) {
+        std::ostringstream oss;
+        oss << "Trigger matched (triggers::matched_t) during step: address=0x" << std::hex << t.address << std::dec;
+        last_error_ = oss.str();
+        return false;
     } catch (trap_t& t) {
         // Note: Spike normally handles traps internally via take_trap() in execute.cc
         // and does NOT throw here. This catch is a fallback for unusual situations.
@@ -689,7 +735,16 @@ bool SpikeEngine::step_until_in_region() {
             } catch (const char* msg) {
                 oss << " (C-string: " << msg << ")";
             } catch (...) {
-                oss << " (truly unknown type)";
+                // Advanced: try to get the real type name
+                std::type_info* t = abi::__cxa_current_exception_type();
+                if (t) {
+                    int status;
+                    char* demangled = abi::__cxa_demangle(t->name(), 0, 0, &status);
+                    oss << " (Type: " << (demangled ? demangled : t->name()) << ")";
+                    if (demangled) free(demangled);
+                } else {
+                    oss << " (truly unknown type)";
+                }
             }
         }
         last_error_ = oss.str();
